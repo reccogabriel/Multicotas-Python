@@ -9,6 +9,7 @@ Plataforma alvo: Windows (com OneDrive instalado para sincronização)
 Principais recursos
 
 Tecnologia utilizada Python
+
 SQLite
 
 Interface simples (PyQt5) com:
