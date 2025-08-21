@@ -11,14 +11,16 @@ from openpyxl import Workbook, load_workbook
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
+import time
+import re
 
 # ---- Caminho do banco robusto para .py e .exe (PyInstaller) ----
-# CONFIG_FILE will be set after resource_path is defined
+# CONFIG_UI_FILE will be set after resource_path is defined
 
 def ler_config_str(chave, padrao=""):
     try:
-        if os.path.exists(CONFIG_FILE):
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+        if os.path.exists(CONFIG_UI_FILE):
+            with open(CONFIG_UI_FILE, "r", encoding="utf-8") as f:
                 for linha in f:
                     if "=" in linha:
                         k, v = linha.strip().split("=", 1)
@@ -50,6 +52,17 @@ def get_conn(db_path):
     cur.execute("PRAGMA foreign_keys=ON;")
     return conn
 
+def operacao_com_retry(func, max_tentativas=3):
+    """Executa uma função com retentativas progressivas em caso de 'database is locked'."""
+    for tentativa in range(max_tentativas):
+        try:
+            return func()
+        except sqlite3.OperationalError as e:
+            if "locked" in str(e).lower() and tentativa < max_tentativas - 1:
+                time.sleep(0.5 * (tentativa + 1))  # backoff simples
+                continue
+            raise
+
 def resource_path(relative_path):
     """Retorna caminho absoluto para arquivo, mesmo no executável."""
     if hasattr(sys, '_MEIPASS'):  # Quando rodando pelo PyInstaller
@@ -64,8 +77,24 @@ os.environ['QT_FONT_DPI'] = '96'
 
 LOG_DIR = "logs"
 BACKUP_DIR = "backups"
-CONFIG_FILE = resource_path("config.txt")
-DB_FILE = (ler_config_str("DB_PATH") or os.path.join(app_base_dir(), "dados", "multipool.db"))
+CONFIG_DB_FILE = resource_path("db_config.txt")
+CONFIG_UI_FILE = resource_path("ui_config.txt")
+
+def ler_config_kv(path, chave, padrao=""):
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                for linha in f:
+                    if "=" in linha:
+                        k, v = linha.strip().split("=", 1)
+                        if k.strip().upper() == chave.upper():
+                            return v.strip()
+    except Exception:
+        pass
+    return padrao
+
+DB_FILE = (ler_config_kv(CONFIG_DB_FILE, "DB_PATH") or os.path.join(app_base_dir(), "dados", "multipool.db"))
+LOCK_TTL_MIN = int(ler_config_kv(CONFIG_UI_FILE, "LOCK_TTL_MIN", "45") or 45)
 os.makedirs(os.path.join(app_base_dir(), "dados"), exist_ok=True)
 ONEDRIVE_FILE = "onedrive_path.txt"
 LOGO_PATH = resource_path("logo.png")
@@ -128,21 +157,21 @@ def exportar_para_excel(dados, nome_arquivo):
         ws.append(linha_export)
     wb.save(caminho)
     return caminho
-
 def salvar_config(aba, criterio):
-    with open(CONFIG_FILE, "w") as f:
+    with open(CONFIG_UI_FILE, "w", encoding="utf-8") as f:
         f.write(f"{aba}\n{criterio}")
 
 def carregar_config():
-    if not os.path.exists(CONFIG_FILE):
+    """Carrega a aba e o critério de ordenação salvos no arquivo de configuração."""
+    if not os.path.exists(CONFIG_UI_FILE):
         return 0, "ENTRADA"
     try:
-        with open(CONFIG_FILE, "r") as f:
+        with open(CONFIG_UI_FILE, "r", encoding="utf-8") as f:
             linhas = f.readlines()
             aba = int(linhas[0].strip()) if linhas else 0
             criterio = linhas[1].strip() if len(linhas) > 1 else "ENTRADA"
             return aba, criterio
-    except:
+    except Exception:
         return 0, "ENTRADA"
 
 class DatabaseManager:
@@ -181,6 +210,14 @@ class DatabaseManager:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_registros_entrada ON registros(entrada);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_registros_cotista ON registros(cotista COLLATE NOCASE);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_registros_emp ON registros(empreendimento COLLATE NOCASE);")
+            # Índice único para evitar duplicatas (cotista, entrada, empreendimento)
+            try:
+                conn.execute("""
+                    CREATE UNIQUE INDEX IF NOT EXISTS ux_registros_cotista_entrada_emp
+                    ON registros(cotista, entrada, COALESCE(empreendimento, ''))
+                """)
+            except Exception:
+                pass
             # 3. Garantir que as colunas novas existam (compatibilidade com bancos antigos)
             cursor = conn.cursor()
             cursor.execute("PRAGMA table_info(registros)")
@@ -275,24 +312,73 @@ class DatabaseManager:
             """, (id_registro,))
             return cursor.fetchone()
 
-def existe_duplicata(self, cotista, entrada, empreendimento):
-    with get_conn(self.db_file) as conn:
-        cursor = conn.cursor()
-        cursor.execute("""SELECT COUNT(*) FROM registros
-                          WHERE cotista=? AND entrada=? AND COALESCE(empreendimento,'')=COALESCE(?, '')""",
-                       (cotista, entrada, empreendimento))
-        return cursor.fetchone()[0] > 0
-
-
-    def excluir(self, id_registro):
+    def existe_duplicata(self, cotista, entrada, empreendimento):
         with get_conn(self.db_file) as conn:
-            cur = conn.cursor()
-            cur.execute("SELECT cotista FROM registros WHERE id=?", (id_registro,))
-            row = cur.fetchone()
-            cotista = row[0] if row else None
-            conn.execute("DELETE FROM registros WHERE id=?", (id_registro,))
-            registrar_log("EXCLUIR", f"ID: {id_registro}, Cotista: {cotista or 'N/D'}")
-            return cotista
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT COUNT(*) FROM registros 
+                WHERE cotista=? AND entrada=? AND COALESCE(empreendimento, '')=?
+                """,
+                (cotista, entrada, empreendimento or '')
+            )
+            return cursor.fetchone()[0] > 0
+
+        
+    # Adicionar paginação para grandes datasets
+    def buscar_paginado(self, criterio="ENTRADA", pagina=1, por_pagina=100):
+        """Retorna registros paginados ordenados por entrada ou cotista."""
+        offset = (pagina - 1) * por_pagina
+        allowed = {"ENTRADA": "entrada", "COTISTA": "cotista"}
+        col = allowed.get(str(criterio).upper(), "entrada")
+        with get_conn(self.db_file) as conn:
+            cursor = conn.cursor()
+            cursor.execute(f"""
+                SELECT id, cotista, contato, empreendimento, entrada, saida, dormitorio, valor,
+                       disponivel, fonte, numero_cota, numero_apartamento, torre, letra_prioridade
+                FROM registros
+                ORDER BY {col} COLLATE NOCASE
+                LIMIT ? OFFSET ?
+            """, (por_pagina, offset))
+            return cursor.fetchall()
+
+    def validar_dados(self, dados):
+        """Valida tupla/lista de dados no formato esperado pelo banco."""
+        erros = []
+        # Cotista obrigatório
+        if not dados or not dados[0] or not str(dados[0]).strip():
+            erros.append("Campo Cotista é obrigatório")
+        # Data de entrada (YYYY-MM-DD)
+        try:
+            datetime.datetime.strptime(dados[3], "%Y-%m-%d")
+        except Exception:
+            erros.append("Data de entrada inválida (use o calendário)")
+        # Telefone (opcional)
+        if len(dados) > 1 and dados[1]:
+            if not re.match(r'^\(?\d{2}\)?\s?\d{4,5}-\d{4}$', str(dados[1])):
+                erros.append("Formato de telefone inválido. Ex: (17) 99624-5935")
+        return erros
+    def excluir(self, id_registro):
+        """Exclui um registro por ID com log. Retorna True se excluiu, False se não encontrou."""
+        try:
+            with get_conn(self.db_file) as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT cotista FROM registros WHERE id=?", (id_registro,))
+                row = cur.fetchone()
+                if not row:
+                    return False
+                cotista = row[0]
+                cur.execute("DELETE FROM registros WHERE id=?", (id_registro,))
+                registrar_log("EXCLUIR", f"ID: {id_registro}, Cotista: {cotista}")
+                return True
+        except Exception as e:
+            # Preferimos não estourar exceção para a UI; retorna False e loga
+            try:
+                registrar_log("ERRO", f"Falha ao excluir ID {id_registro}: {e}")
+            except Exception:
+                pass
+            return False
+
 class MplCanvas(FigureCanvas):
     def __init__(self, width=12, height=8, dpi=100):
         self.fig = Figure(figsize=(width, height), dpi=dpi, facecolor='#2d2d2d')
@@ -515,7 +601,16 @@ class MultipoolOlimpiaApp(QtWidgets.QMainWindow):
         if not os.path.exists(self.LOCK_FILE):
             return False
 
-        # Tenta detectar lock "de verdade" no SQLite
+        
+        # Checar TTL do lock (expiração)
+        try:
+            mtime = datetime.datetime.fromtimestamp(os.path.getmtime(self.LOCK_FILE))
+            if (datetime.datetime.now() - mtime).total_seconds() > LOCK_TTL_MIN * 60:
+                os.remove(self.LOCK_FILE)
+                return False
+        except Exception:
+            pass
+# Tenta detectar lock "de verdade" no SQLite
         try:
             with get_conn(DB_FILE) as conn:
                 try:
@@ -689,7 +784,7 @@ class MultipoolOlimpiaApp(QtWidgets.QMainWindow):
                     pass
             handler = _noop
             self.filtrar_dados = handler
-        self.search_input.textChanged.connect(handler)
+        self.search_input.textChanged.connect(self.filtrar_dados)
         self.search_input.returnPressed.connect(handler)
         
         self.btn_limpar_pesquisa = QtWidgets.QPushButton("✖ Limpar")
@@ -1124,6 +1219,36 @@ class MultipoolOlimpiaApp(QtWidgets.QMainWindow):
                     
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Erro", f"Erro ao carregar dados: {str(e)}")
+    def carregar_dados_filtrados(self, registros):
+        hoje = datetime.date.today()
+        self.future_table.setRowCount(0)
+        self.past_table.setRowCount(0)
+        for registro in registros:
+            try:
+                data_entrada = datetime.datetime.strptime(str(registro[4])[:10], "%Y-%m-%d").date() if registro[4] else hoje
+                table = self.future_table if data_entrada >= hoje else self.past_table
+                row = table.rowCount()
+                table.insertRow(row)
+                for col, valor in enumerate(registro[:10]):
+                    v = valor
+                    if col in (4, 5) and valor:
+                        try:
+                            v = datetime.datetime.strptime(str(valor)[:10], "%Y-%m-%d").strftime("%d/%m/%Y")
+                        except Exception:
+                            v = str(valor)
+                    item = QtWidgets.QTableWidgetItem(str(v) if v is not None else "")
+                    item.setData(QtCore.Qt.UserRole, registro[0])
+                    if col == 8:
+                        if str(valor).strip().lower() == "não":
+                            item.setBackground(QtGui.QColor(255, 200, 200))
+                            item.setForeground(QtGui.QColor(0, 0, 0))
+                        else:
+                            item.setBackground(QtGui.QColor(200, 255, 200))
+                            item.setForeground(QtGui.QColor(0, 0, 0))
+                    table.setItem(row, col, item)
+            except Exception:
+                continue
+
 
     def adicionar(self):
         if self.read_only:
@@ -1640,6 +1765,31 @@ Urgentes (7 dias): {(proximos_7_dias/futuras*100) if futuras > 0 else 0:.1f}% da
                 self.search_input.selectAll()
         except:
             pass
+    def limpar_pesquisa(self):
+        """Limpa o campo de pesquisa e recarrega todos os registros."""
+        try:
+            # Limpa o texto se o campo existir
+            if hasattr(self, 'search_input') and self.search_input is not None:
+                if self.search_input.text():
+                    self.search_input.clear()
+                # Reposiciona o foco no campo para facilitar nova busca
+                self.search_input.setFocus()
+            # Recarrega todos os dados
+            if hasattr(self, 'load_data'):
+                self.load_data()
+            # Feedback ao usuário
+            try:
+                sb = self.statusBar()
+                if sb:
+                    sb.showMessage("Pesquisa limpa. Exibindo todos os registros.")
+            except Exception:
+                pass
+        except Exception as e:
+            # Não interromper o fluxo por erro de UI; apenas notificar
+            try:
+                QtWidgets.QMessageBox.warning(self, "Aviso", f"Falha ao limpar pesquisa:\n{e}")
+            except Exception:
+                pass
 
     def salvar_configuracao(self):
         """Salvar configuração atual (aba e critério de ordenação)"""
@@ -1789,128 +1939,53 @@ Urgentes (7 dias): {(proximos_7_dias/futuras*100) if futuras > 0 else 0:.1f}% da
                         QtWidgets.QMessageBox.warning(self, "Aviso", f"Falha ao sincronizar registros iguais:\n{str(e)}")
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Erro", f"Erro ao editar: {str(e)}")
-
-    def excluir(self):
+    def excluir(self, *args, **kwargs):
+        """Exclui o registro selecionado na tabela atual (futuras ou passadas)."""
         if self.read_only:
             QtWidgets.QMessageBox.warning(
                 self,
                 "Somente Leitura",
-                "O sistema está em modo leitura. Não é possível alterar dados agora."
+                "O sistema está em modo leitura. Não é possível excluir registros agora."
             )
             return
 
         table = self.get_current_table()
         current_row = table.currentRow()
-
-        if current_row >= 0:
-            id_item = table.item(current_row, 0)
-            cotista_item = table.item(current_row, 1)
-
-            if id_item and cotista_item:
-                resposta = QtWidgets.QMessageBox.question(
-                    self, "Confirmar Exclusão", 
-                    f"Tem certeza que deseja excluir o registro de:\n{cotista_item.text()}?",
-                    QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
-                    QtWidgets.QMessageBox.No
-                )
-
-                if resposta == QtWidgets.QMessageBox.Yes:
-                    try:
-                        id_registro = int(id_item.text())
-                        cotista_excluido = self.db.excluir(id_registro)
-                        if cotista_excluido:
-                            self.ultimo_excluido = id_registro
-                            self.load_data()
-                            self.statusBar().showMessage(f"Registro de {cotista_excluido} excluído!")
-                            self.session_dirty = True
-                    except Exception as e:
-                        QtWidgets.QMessageBox.critical(self, "Erro", f"Erro ao excluir: {str(e)}")
-        else:
+        if current_row < 0:
             QtWidgets.QMessageBox.information(self, "Aviso", "Selecione um registro para excluir.")
+            return
 
-    def carregar_dados_filtrados(self, registros_filtrados):
-        """Carregar dados filtrados nas tabelas"""
+        id_item = table.item(current_row, 0)
+        if not id_item:
+            QtWidgets.QMessageBox.information(self, "Aviso", "Selecione um registro válido.")
+            return
+
         try:
-            from datetime import datetime, date
+            id_registro = int(id_item.text())
+        except Exception:
+            QtWidgets.QMessageBox.warning(self, "Aviso", "ID inválido.")
+            return
 
-            # Separar registros por categoria
-            hoje = date.today()
-            futuras = []
-            passadas = []
+        resp = QtWidgets.QMessageBox.question(
+            self,
+            "Confirmar exclusão",
+            f"Tem certeza que deseja excluir o registro ID {id_registro}?",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No
+        )
+        if resp != QtWidgets.QMessageBox.Yes:
+            return
 
-            for registro in registros_filtrados:
-                try:
-                    data_entrada = datetime.strptime(registro[4][:10], "%Y-%m-%d").date()
-                    if data_entrada >= hoje:
-                        futuras.append(registro)
-                    else:
-                        passadas.append(registro)
-                except:
-                    futuras.append(registro)
+        ok = self.db.excluir(id_registro)
+        if not ok:
+            QtWidgets.QMessageBox.warning(self, "Aviso", "Registro não encontrado ou falha ao excluir.")
+            return
 
-            # Carregar dados nas tabelas
-            self.carregar_tabela_com_dados(self.future_table, futuras)
-            self.carregar_tabela_com_dados(self.past_table, passadas)
+        table.removeRow(current_row)
+        self.statusBar().showMessage(f"Registro {id_registro} excluído.")
+        self.session_dirty = True
 
-            # Atualizar status
-            if hasattr(self, 'statusBar') and self.statusBar():
-                self.statusBar().showMessage(f"Filtro aplicado - {len(registros_filtrados)} registro(s)")
-
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Erro", f"Erro ao carregar dados filtrados:\n{str(e)}")
-
-    def carregar_tabela_com_dados(self, table, registros):
-        """Carregar dados em uma tabela específica"""
-        try:
-            # Salvar estado atual das colunas
-            header = table.horizontalHeader()
-            column_widths = []
-            for i in range(table.columnCount()):
-                column_widths.append(header.sectionSize(i))
-
-            table.setRowCount(0)
-
-            for row, registro in enumerate(registros):
-                table.insertRow(row)
-
-                # Mostrar apenas os primeiros 10 campos
-                for col, valor in enumerate(registro[:10]):
-                    if col == 4 or col == 5:  # Datas
-                        valor = formatar_data_display(valor)
-
-                    item = QtWidgets.QTableWidgetItem(str(valor) if valor else "")
-                    item.setData(QtCore.Qt.UserRole, registro[0])  # Armazenar ID
-
-                    # Colorir por disponibilidade
-                    if col == 8:  # Coluna Disponível
-                        if valor == "Não":
-                            item.setBackground(QtGui.QColor(255, 200, 200))
-                            item.setForeground(QtGui.QColor(0, 0, 0))  # Texto preto
-                        else:
-                            item.setBackground(QtGui.QColor(200, 255, 200))
-                            item.setForeground(QtGui.QColor(0, 0, 0))  # Texto preto
-
-                    table.setItem(row, col, item)
-
-            # Restaurar larguras das colunas
-            for i, width in enumerate(column_widths):
-                if i < table.columnCount():
-                    header.resizeSection(i, width)
-
-        except Exception as e:
-            print(f"Erro ao carregar tabela: {e}")
-
-    def limpar_pesquisa(self):
-        """Limpar campo de pesquisa e mostrar todos os dados"""
-        try:
-            if hasattr(self, 'search_input'):
-                self.search_input.clear()
-            self.load_data()
-            if hasattr(self, 'statusBar') and self.statusBar():
-                self.statusBar().showMessage("Pesquisa limpa - Mostrando todos os registros")
-        except Exception as e:
-            print(f"Erro ao limpar pesquisa: {e}")
-            QtWidgets.QMessageBox.critical(self, "Erro", f"Erro ao limpar pesquisa:\n{str(e)}")
+    # Adicionar no DatabaseManager
 
 def main():
     # Configurações iniciais
@@ -1993,6 +2068,7 @@ def main():
     except Exception as e:
         QtWidgets.QMessageBox.critical(None, "Erro Fatal", f"Erro ao iniciar aplicação:\n{str(e)}")
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
