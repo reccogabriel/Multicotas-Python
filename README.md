@@ -1,7 +1,8 @@
 # Multicotas-Python
 Multipool Olímpia
 
-Sistema organizador de cotistas de multipropriedade, focado na visualização e gestão das datas de locação deixadas em nossa imobiliária.
+Sistema organizador de cotistas de multipropriedade, focado na visualização e gestão das datas de deixadas por clientes/proprietários de multipropriedades em nossa imobiliária para locação.
+Oferecemos aqui um serviço que funciona da seguinte forma: nossa cidade é turística e conta com inúmeros resorts de multipropriedade, onde os proprietários que não estão satisfeitos com os serviços prestados pelos resorts, ou simplesmente nos encontram através de tráfego pago ou orgânico, os clientes/proprietários possuem datas disponíveis que normalmente são estipuladas por um cronograma de utilização pelo próprio empreendimento, nós realizamos todo o cadastro dessas e fazemos a locação para terceiros, onde cobramos uma taxa de até 30% se a locação é efetivada. 
 
 Autor: Gabriel Recco Silva
 Plataforma alvo: Windows (com OneDrive instalado para sincronização)
@@ -124,5 +125,6 @@ Logs: gravados em logs/log_YYYY-MM-DD.txt a cada ação (inserir/atualizar/exclu
 Licença
 
 Uso interno da Multicotas Olímpia
+
 Entre em contato para termos específicos de distribuição.
 
