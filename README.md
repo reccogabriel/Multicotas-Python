@@ -1,3 +1,4 @@
+Exercícios Práticos - Ciência da Computação - Cruzeiro do Sul
 # Multicotas-Python
 Multipool Olímpia
 
